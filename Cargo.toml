@@ -35,6 +35,9 @@ fastembed = "4"
 base64 = "0.22"
 hex = "0.4"
 
+# Image processing (downscale/recompress oversized image attachments)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+
 # Compression
 flate2 = "1"
 
