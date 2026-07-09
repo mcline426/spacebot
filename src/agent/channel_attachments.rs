@@ -28,6 +28,22 @@ const TEXT_MIME_PREFIXES: &[&str] = &[
     "application/yaml",
 ];
 
+/// Anthropic (and other vision providers) reject an image whose base64-encoded
+/// payload exceeds 10 MB. We keep a safety margin below that: if the encoded
+/// size would exceed this, the image is downscaled and re-encoded before it is
+/// sent. Base64 inflates raw bytes by ~4/3, so this corresponds to ~3.75 MB of
+/// raw image data.
+const MAX_IMAGE_BASE64_BYTES: usize = 5 * 1024 * 1024;
+
+/// Longest edge (in pixels) that oversized images are downscaled to. The vision
+/// models downsample images above roughly this size anyway, so shrinking here
+/// costs no analyzable detail while dramatically reducing payload size.
+const MAX_IMAGE_EDGE: u32 = 1568;
+
+/// JPEG quality levels tried, in order, when re-encoding an oversized image.
+/// The first result that fits under the size cap wins.
+const JPEG_QUALITY_STEPS: &[u8] = &[85, 70, 55, 40];
+
 /// Download attachments and convert them to LLM-ready UserContent parts.
 ///
 /// Images become `UserContent::Image` (base64). Text files get inlined.
@@ -68,6 +84,89 @@ pub(crate) async fn download_attachments(
     }
 
     parts
+}
+
+/// Base64-encode image bytes for a vision model, downscaling and re-encoding
+/// first when the encoded payload would exceed the provider's size limit.
+///
+/// Returns the base64 string plus the media type actually used — this is the
+/// original type when the image is sent unchanged, or JPEG after recompression.
+fn encode_image_for_llm(
+    bytes: &[u8],
+    mime_type: &str,
+    filename: &str,
+) -> (String, ImageMediaType) {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    // base64 inflates by ~4/3; check the *encoded* size against the limit.
+    let estimated_base64 = bytes.len().saturating_mul(4) / 3;
+    if estimated_base64 <= MAX_IMAGE_BASE64_BYTES {
+        return (engine.encode(bytes), ImageMediaType::from_mime_type(mime_type));
+    }
+
+    match shrink_image(bytes) {
+        Some(jpeg) => {
+            tracing::info!(
+                filename = %filename,
+                original_bytes = bytes.len(),
+                shrunk_bytes = jpeg.len(),
+                "downscaled oversized image for vision model"
+            );
+            (engine.encode(&jpeg), ImageMediaType::from_mime_type("image/jpeg"))
+        }
+        None => {
+            // Could not decode/shrink (unknown or corrupt encoding). Send the
+            // original and let the provider decide — no worse than before.
+            tracing::warn!(
+                filename = %filename,
+                bytes = bytes.len(),
+                "oversized image could not be downscaled; sending original"
+            );
+            (engine.encode(bytes), ImageMediaType::from_mime_type(mime_type))
+        }
+    }
+}
+
+/// Decode an image, downscale its long edge to `MAX_IMAGE_EDGE`, and re-encode
+/// as JPEG, stepping quality down until the encoded result fits under the size
+/// cap. Returns `None` if the bytes cannot be decoded as a supported image.
+fn shrink_image(bytes: &[u8]) -> Option<Vec<u8>> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+
+    // Only ever shrink, never upscale — preserves aspect ratio.
+    let scaled = if decoded.width().max(decoded.height()) > MAX_IMAGE_EDGE {
+        decoded.resize(
+            MAX_IMAGE_EDGE,
+            MAX_IMAGE_EDGE,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+
+    // JPEG has no alpha channel — flatten to RGB8.
+    let rgb = image::DynamicImage::ImageRgb8(scaled.to_rgb8());
+
+    let mut last: Option<Vec<u8>> = None;
+    for &quality in JPEG_QUALITY_STEPS {
+        let mut buf = Vec::new();
+        {
+            let mut encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+            if encoder.encode_image(&rgb).is_err() {
+                return last;
+            }
+        }
+        if buf.len().saturating_mul(4) / 3 <= MAX_IMAGE_BASE64_BYTES {
+            return Some(buf);
+        }
+        last = Some(buf);
+    }
+
+    // Even the lowest quality didn't fit (extremely unlikely at 1568px). Return
+    // the smallest attempt — still far under the original size.
+    last
 }
 
 /// Download raw bytes from an attachment URL, including auth if present.
@@ -173,10 +272,6 @@ async fn download_image_attachment(
         }
     };
 
-    use base64::Engine as _;
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let media_type = ImageMediaType::from_mime_type(&attachment.mime_type);
-
     tracing::info!(
         filename = %attachment.filename,
         mime = %attachment.mime_type,
@@ -184,6 +279,8 @@ async fn download_image_attachment(
         "downloaded image attachment"
     );
 
+    let (base64_data, media_type) =
+        encode_image_for_llm(&bytes, &attachment.mime_type, &attachment.filename);
     UserContent::image_base64(base64_data, media_type, None)
 }
 
@@ -464,9 +561,8 @@ pub(crate) fn content_from_bytes(bytes: &[u8], attachment: &crate::Attachment) -
         .any(|p| attachment.mime_type.starts_with(p));
 
     if is_image {
-        use base64::Engine as _;
-        let base64_data = base64::engine::general_purpose::STANDARD.encode(bytes);
-        let media_type = ImageMediaType::from_mime_type(&attachment.mime_type);
+        let (base64_data, media_type) =
+            encode_image_for_llm(bytes, &attachment.mime_type, &attachment.filename);
         UserContent::image_base64(base64_data, media_type, None)
     } else if is_text {
         let content = String::from_utf8_lossy(bytes).into_owned();
