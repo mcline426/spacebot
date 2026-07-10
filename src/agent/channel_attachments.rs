@@ -95,7 +95,7 @@ fn encode_image_for_llm(
     bytes: &[u8],
     mime_type: &str,
     filename: &str,
-) -> (String, ImageMediaType) {
+) -> (String, Option<ImageMediaType>) {
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
 

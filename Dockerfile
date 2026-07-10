@@ -29,6 +29,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs \
     && echo "fn main() {}" > src/bin/openapi_spec.rs \
+    && cargo update -p ethnum \
     && cargo build --release --features metrics \
     && rm -rf src
 
